@@ -1,0 +1,402 @@
+name: Restore and merge h5-to-html
+
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/restore-merge-h5.yml]
+
+permissions:
+  contents: write
+
+jobs:
+  merge:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Restore full source and apply multi-H5 changes
+        shell: bash
+        run: |
+          git show 4f186c4c0e94de404d89cf0d3c34b00ad78fda40:h5-to-html.py > h5-to-html.py
+          python - <<'PY'
+          from pathlib import Path
+
+          p = Path('h5-to-html.py')
+          s = p.read_text(encoding='utf-8')
+
+          collection_code = r'''
+
+          def _read_start_time_attr(attrs: dict) -> float:
+              raw_time = attrs.get("start_time", 0.0)
+              if isinstance(raw_time, bytes):
+                  raw_time = raw_time.decode("utf-8")
+              if isinstance(raw_time, str):
+                  try:
+                      return _parse_flexible_timestamp(raw_time).timestamp()
+                  except (ValueError, OverflowError):
+                      try:
+                          return float(raw_time)
+                      except (ValueError, TypeError):
+                          return 0.0
+              try:
+                  return float(raw_time)
+              except (ValueError, TypeError):
+                  return 0.0
+
+
+          def _pool_time_percentile(data: np.ndarray, edges: np.ndarray, percentile: float) -> np.ndarray:
+              out = np.empty((len(edges) - 1, data.shape[1]), dtype=np.float32)
+              for i in range(len(out)):
+                  out[i] = np.percentile(data[edges[i]:edges[i + 1]], percentile, axis=0)
+              return out
+
+
+          def read_activity_h5_collection(
+              paths: list[Path | str],
+              time_stride: int = 4,
+              channel_stride: int = 5,
+              target_time_rows: int = 6000,
+              percentile: float = 95.0,
+          ) -> dict:
+              """Сортирует H5 по start_time, прореживает 4×5 и объединяет через P95."""
+              if time_stride < 1 or channel_stride < 1 or target_time_rows < 1:
+                  raise ValueError("Шаги прореживания и target_time_rows должны быть >= 1")
+
+              infos = []
+              for raw_path in paths:
+                  path = Path(raw_path)
+                  with h5py.File(str(path), "r") as f:
+                      attrs = {k: f.attrs[k] for k in f.attrs.keys()}
+                      keys = {
+                          k for k in f.keys()
+                          if isinstance(f[k], h5py.Dataset)
+                          and f[k].ndim == 2
+                          and "offset" not in k
+                      }
+                      if not keys:
+                          raise ValueError(f"Не найдено 2D матриц в файле {path}")
+                      infos.append({
+                          "path": path,
+                          "attrs": attrs,
+                          "start": _read_start_time_attr(attrs),
+                          "keys": keys,
+                          "shapes": {k: tuple(f[k].shape) for k in keys},
+                      })
+
+              infos.sort(key=lambda x: (
+                  x["start"] <= 0,
+                  x["start"] if x["start"] > 0 else float("inf"),
+                  x["path"].name,
+              ))
+              common_keys = set.intersection(*(x["keys"] for x in infos))
+              if not common_keys:
+                  raise ValueError("В файлах нет общей 2D-метрики")
+
+              preferred = [k for k in common_keys if "count" not in k]
+              shape_key = "mean" if "mean" in common_keys else sorted(preferred or common_keys)[0]
+              channel_count = infos[0]["shapes"][shape_key][1]
+              for info in infos:
+                  if info["shapes"][shape_key][1] != channel_count:
+                      raise ValueError("Файлы содержат разное число каналов")
+
+              print(f"[INFO] Объединение {len(infos)} H5-файлов по start_time:")
+              for i, info in enumerate(infos, 1):
+                  print(f"  {i:02d}. {info['start']:.6f} | {info['path'].name}")
+
+              sampled_times = []
+              total_original_windows = 0
+              expected_rows = []
+              for info in infos:
+                  rows = info["shapes"][shape_key][0]
+                  expected_rows.append(len(range(0, rows, time_stride)))
+                  total_original_windows += rows
+                  attrs = info["attrs"]
+                  sr = float(attrs.get("sample_rate_hz", 1.0))
+                  if sr <= 0:
+                      sr = 1.0
+                  with h5py.File(str(info["path"]), "r") as f:
+                      if "time_start_sample" in f:
+                          t0 = np.asarray(f["time_start_sample"][::time_stride], dtype=np.float64) / sr
+                          if "time_stop_sample" in f:
+                              t1 = np.asarray(f["time_stop_sample"][::time_stride], dtype=np.float64) / sr
+                              tx = (t0 + t1) / 2.0
+                          else:
+                              tx = t0
+                      else:
+                          win_sec = float(attrs.get("window_seconds", 1.0))
+                          tx = np.arange(0, rows, time_stride, dtype=np.float64) * win_sec
+                  if info["start"] != 0.0:
+                      tx += info["start"]
+                  sampled_times.append(tx)
+
+              time_concat = np.concatenate(sampled_times)
+              n_out = min(target_time_rows, len(time_concat))
+              edges = np.linspace(0, len(time_concat), n_out + 1, dtype=np.int64)
+              time_axis = np.empty(n_out, dtype=np.float64)
+              for i in range(n_out):
+                  time_axis[i] = float(np.mean(time_concat[edges[i]:edges[i + 1]]))
+
+              arrays: dict[str, np.ndarray] = {}
+              for key in sorted(common_keys):
+                  parts = []
+                  compatible = True
+                  for info, sampled_rows in zip(infos, expected_rows):
+                      shape = info["shapes"].get(key)
+                      if shape is None or shape[0] != info["shapes"][shape_key][0] or shape[1] != channel_count:
+                          compatible = False
+                          break
+                      with h5py.File(str(info["path"]), "r") as f:
+                          part = np.asarray(f[key][::time_stride, ::channel_stride], dtype=np.float32)
+                      if part.shape[0] != sampled_rows:
+                          compatible = False
+                          break
+                      parts.append(part)
+                  if not compatible:
+                      continue
+                  combined = np.concatenate(parts, axis=0)
+                  np.nan_to_num(combined, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+                  arrays[key] = _pool_time_percentile(combined, edges, percentile)
+                  del combined, parts
+                  print(f"[INFO] P{percentile:g}: {key} -> {arrays[key].shape[0]} x {arrays[key].shape[1]}")
+
+              first = infos[0]
+              with h5py.File(str(first["path"]), "r") as f:
+                  arrays["distance_m"] = (
+                      np.asarray(f["distance_m"][::channel_stride], dtype=np.float64)
+                      if "distance_m" in f
+                      else np.arange(0, channel_count, channel_stride, dtype=np.float64)
+                  )
+
+              arrays["time_start_sample"] = time_axis
+              arrays["time_stop_sample"] = time_axis
+              arrays["start_time"] = np.asarray(0.0, dtype=np.float64)
+
+              attrs = dict(first["attrs"])
+              attrs["start_time"] = 0.0
+              attrs["sample_rate_hz"] = 1.0
+              attrs["format"] = f"combined-{len(infos)}-files-p{percentile:g}-uint16"
+              attrs["source_files_count"] = len(infos)
+              attrs["original_windows_count"] = total_original_windows
+              attrs["time_stride"] = time_stride
+              attrs["channel_stride"] = channel_stride
+              attrs["aggregation_percentile"] = percentile
+              return {"arrays": arrays, "attrs": attrs}
+          '''
+
+          marker = '\ndef inject_to_html(html_str: str, css_content: str, js_content: str) -> str:\n'
+          if marker not in s:
+              raise RuntimeError('inject marker not found')
+          s = s.replace(marker, collection_code + marker, 1)
+
+          old = '''def build_interactive_3d(
+              h5_path: Path | str,
+              output_html: Path | str = "activity_3d.html",
+              metric_key: str = "mean",
+          ) -> Path:
+              print(f"[INFO] Загрузка файла {h5_path}...")
+              result = read_activity_h5(h5_path)
+          '''
+          new = '''def build_interactive_3d(
+              h5_path: Path | str | list[Path | str],
+              output_html: Path | str = "activity_3d.html",
+              metric_key: str = "mean",
+              time_stride: int = 4,
+              channel_stride: int = 5,
+              target_time_rows: int = 6000,
+              percentile: float = 95.0,
+          ) -> Path:
+              if isinstance(h5_path, (list, tuple, set)):
+                  paths = [Path(p) for p in h5_path]
+                  print(f"[INFO] Загрузка коллекции из {len(paths)} файлов...")
+                  result = read_activity_h5_collection(
+                      paths, time_stride=time_stride, channel_stride=channel_stride,
+                      target_time_rows=target_time_rows, percentile=percentile,
+                  )
+              else:
+                  print(f"[INFO] Загрузка файла {h5_path}...")
+                  result = read_activity_h5(h5_path)
+          '''
+          if old not in s:
+              raise RuntimeError('builder marker not found')
+          s = s.replace(old, new, 1)
+
+          old = '''    # ===== МАСТЕР-ДАТАСЕТ =====
+              MASTER_MAX_DIM = 600
+              step_win_m = max(1, n_windows // MASTER_MAX_DIM)
+              step_chan_m = max(1, n_channels // MASTER_MAX_DIM)
+          '''
+          new = '''    # ===== МАСТЕР-ДАТАСЕТ =====
+              MASTER_MAX_TIME = 6000
+              MASTER_MAX_CHANNELS = 1000
+              step_win_m = max(1, int(np.ceil(n_windows / MASTER_MAX_TIME)))
+              step_chan_m = max(1, int(np.ceil(n_channels / MASTER_MAX_CHANNELS)))
+          '''
+          if old not in s:
+              raise RuntimeError('master marker not found')
+          s = s.replace(old, new, 1)
+
+          old = '''            sub = np.ascontiguousarray(arr[::step_win_m, ::step_chan_m], dtype=np.float32)
+                      # Base64-кодирование: rows|cols|base64data — в 4× компактнее JSON
+                      b64 = base64.b64encode(sub.tobytes()).decode('ascii')
+                      all_metrics_master[m] = f"{sub.shape[0]}|{sub.shape[1]}|{b64}"
+          '''
+          new = '''            sub = np.ascontiguousarray(arr[::step_win_m, ::step_chan_m], dtype=np.float32)
+                      q_min = float(np.min(sub))
+                      q_max = float(np.max(sub))
+                      if q_max > q_min:
+                          quantized = np.rint((sub - q_min) * (65535.0 / (q_max - q_min))).clip(0, 65535).astype("<u2")
+                      else:
+                          quantized = np.zeros(sub.shape, dtype="<u2")
+                      b64 = base64.b64encode(quantized.tobytes()).decode("ascii")
+                      all_metrics_master[m] = f"u16|{sub.shape[0]}|{sub.shape[1]}|{q_min:.17g}|{q_max:.17g}|{b64}"
+          '''
+          if old not in s:
+              raise RuntimeError('encoding marker not found')
+          s = s.replace(old, new, 1)
+
+          old = '''    def _decode_b64_f32(encoded: str) -> np.ndarray:
+                  """Декодирует Base64 float32 строку → 2D numpy массив."""
+                  parts = encoded.split('|')
+                  rows, cols = int(parts[0]), int(parts[1])
+                  raw = base64.b64decode(parts[2])
+                  return np.frombuffer(raw, dtype=np.float32).reshape(rows, cols)
+          '''
+          new = '''    def _decode_master_array(encoded: str) -> np.ndarray:
+                  """Декодирует uint16-квантизованный мастер-массив."""
+                  parts = encoded.split("|", 5)
+                  if parts[0] == "u16":
+                      rows, cols = int(parts[1]), int(parts[2])
+                      lo, hi = float(parts[3]), float(parts[4])
+                      raw = base64.b64decode(parts[5])
+                      q = np.frombuffer(raw, dtype="<u2").reshape(rows, cols)
+                      if hi <= lo:
+                          return np.full((rows, cols), lo, dtype=np.float32)
+                      return (lo + q.astype(np.float32) * ((hi - lo) / 65535.0)).astype(np.float32)
+                  rows, cols = int(parts[0]), int(parts[1])
+                  raw = base64.b64decode(parts[2])
+                  return np.frombuffer(raw, dtype=np.float32).reshape(rows, cols)
+          '''
+          if old not in s:
+              raise RuntimeError('python decoder marker not found')
+          s = s.replace(old, new, 1)
+          s = s.replace('_decode_b64_f32(all_metrics_master[metric_key])', '_decode_master_array(all_metrics_master[metric_key])', 1)
+          s = s.replace('window.masterMaxDim = {max(master_n_win, master_n_chan)};', 'window.masterMaxDim = {min(1600, max(master_n_win, master_n_chan))};', 1)
+          s = s.replace('window.defaultRes2D = {max(master_n_win, master_n_chan)};', 'window.defaultRes2D = {min(1200, max(master_n_win, master_n_chan))};', 1)
+          s = s.replace('SCRIPT_VERSION = "v4.4-dark-walls"', 'SCRIPT_VERSION = "v4.5-multi-p95-uint16"', 1)
+
+          old = '''  // === Декодирование Base64 float32 данных ===
+            function decodeF32Array(encoded) {
+              var parts = encoded.split('|');
+              var rows = +parts[0], cols = +parts[1];
+              var binary = atob(parts[2]);
+              var buf = new ArrayBuffer(binary.length);
+              var view = new Uint8Array(buf);
+              for (var i = 0; i < binary.length; i++) view[i] = binary.charCodeAt(i);
+              var f32 = new Float32Array(buf);
+              // Собираем 2D-массив
+              var result = [];
+              for (var r = 0; r < rows; r++) {
+                result.push(Array.from(f32.subarray(r * cols, (r + 1) * cols)));
+              }
+              return result;
+            }
+          '''
+          new = '''  // === Декодирование Base64 uint16 с восстановлением реальных значений ===
+            function decodeMasterArray(encoded) {
+              var parts = encoded.split('|');
+              var isU16 = parts[0] === 'u16';
+              var rows = +(isU16 ? parts[1] : parts[0]);
+              var cols = +(isU16 ? parts[2] : parts[1]);
+              var lo = isU16 ? +parts[3] : 0;
+              var hi = isU16 ? +parts[4] : 0;
+              var binary = atob(isU16 ? parts[5] : parts[2]);
+              var buf = new ArrayBuffer(binary.length);
+              var view = new Uint8Array(buf);
+              for (var i = 0; i < binary.length; i++) view[i] = binary.charCodeAt(i);
+              var typed = isU16 ? new Uint16Array(buf) : new Float32Array(buf);
+              var scale = isU16 && hi > lo ? (hi - lo) / 65535.0 : 0;
+              var result = [];
+              for (var r = 0; r < rows; r++) {
+                var row = new Array(cols);
+                var off = r * cols;
+                for (var c = 0; c < cols; c++) {
+                  row[c] = isU16 ? lo + typed[off + c] * scale : typed[off + c];
+                }
+                result.push(row);
+              }
+              return result;
+            }
+          '''
+          if old not in s:
+              raise RuntimeError('javascript decoder marker not found')
+          s = s.replace(old, new, 1)
+          s = s.replace('window.masterData[key] = decodeF32Array(val);', 'window.masterData[key] = decodeMasterArray(val);', 1)
+
+          start = s.index('def main():\n')
+          end = s.index('\n\nif __name__ == "__main__":', start)
+          new_main = '''def main():
+              parser = argparse.ArgumentParser(
+                  description="Интерактивный общий 3D/2D график для последовательной коллекции .h5."
+              )
+              parser.add_argument(
+                  "inputs", nargs="*",
+                  help="Файлы или папки. Без аргументов берутся все .h5/.hdf5 рядом со скриптом.",
+              )
+              parser.add_argument("-o", "--output", default="combined_activity_uint16.html")
+              parser.add_argument("--metric", default="mean")
+              parser.add_argument("--time-stride", type=int, default=4)
+              parser.add_argument("--channel-stride", type=int, default=5)
+              parser.add_argument("--target-time-rows", type=int, default=6000)
+              parser.add_argument("--percentile", type=float, default=95.0)
+              parser.add_argument("--demo", action="store_true")
+              args = parser.parse_args()
+
+              if args.demo:
+                  demo_synthetic(output_html=args.output)
+                  return
+
+              paths: list[Path] = []
+              if args.inputs:
+                  for raw in args.inputs:
+                      p = Path(raw).resolve()
+                      if p.is_dir():
+                          paths.extend(p.glob("*.h5"))
+                          paths.extend(p.glob("*.hdf5"))
+                      else:
+                          paths.append(p)
+              else:
+                  folder = Path(__file__).resolve().parent
+                  paths.extend(folder.glob("*.h5"))
+                  paths.extend(folder.glob("*.hdf5"))
+
+              paths = sorted({p.resolve() for p in paths})
+              if not paths:
+                  print("[ERROR] H5-файлы не найдены.")
+                  sys.exit(1)
+              missing = [p for p in paths if not p.exists()]
+              if missing:
+                  print(f"[ERROR] Файл не найден: {missing[0]}")
+                  sys.exit(1)
+
+              build_interactive_3d(
+                  paths, output_html=args.output, metric_key=args.metric,
+                  time_stride=args.time_stride, channel_stride=args.channel_stride,
+                  target_time_rows=args.target_time_rows, percentile=args.percentile,
+              )
+          '''
+          s = s[:start] + new_main + s[end:]
+          p.write_text(s, encoding='utf-8')
+          PY
+          python -m py_compile h5-to-html.py
+
+      - name: Commit merged file and remove workflow
+        shell: bash
+        run: |
+          rm .github/workflows/restore-merge-h5.yml
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add h5-to-html.py .github/workflows/restore-merge-h5.yml
+          git commit -m "Restore full UI and add multi-H5 P95 uint16 processing"
+          git push
